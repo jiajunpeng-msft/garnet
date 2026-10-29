@@ -4,10 +4,13 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Garnet.common;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
+using StackExchange.Redis;
 
 namespace Garnet.test.cluster
 {
@@ -85,6 +88,48 @@ namespace Garnet.test.cluster
         {
             _ = context.clusterTestUtils.ClusterFailover(replicaIndex, option, logger: context.logger);
             context.clusterTestUtils.WaitForPrimaryRole(replicaIndex, context.logger);
+        }
+
+        [Test]
+        [Category("REPLICATION")]
+        public async Task ClusterDisklessSyncAofOnlyClusterRestartPreservesReplicatedWrites([Values] bool enableTls)
+        {
+            const string key = "{aof-recovery}:value";
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            context.CreateInstances(2, enableAOF: true, tryRecover: true, enableDisklessSync: true,
+                useTLS: enableTls, clusterReplicationReestablishmentTimeout: 1);
+            context.CreateConnection(useTLS: enableTls);
+            _ = context.clusterTestUtils.SimpleSetupCluster(1, 1, logger: context.logger);
+
+            var db = context.clusterTestUtils.GetDatabase();
+            ClassicAssert.IsTrue(await db.StringSetAsync(key, "before").ConfigureAwait(false));
+            context.clusterTestUtils.WaitForReplicaAofSync(0, 1, cancellation: deadline.Token);
+            var replica = context.clusterTestUtils.GetServer(1);
+            ClassicAssert.AreEqual("before", (string)await replica.ExecuteAsync(
+                0, "GET", [key], flags: CommandFlags.NoRedirect).ConfigureAwait(false));
+
+            var versionBeforeRestart = context.clusterTestUtils.GetStoreCurrentVersion(0);
+            for (var i = 0; i < context.nodes.Length; i++)
+            {
+                await context.nodes[i].Store.CommitAOFAsync(deadline.Token).ConfigureAwait(false);
+                context.nodes[i].Dispose(false);
+                context.nodes[i] = null;
+            }
+            context.RestartNode(0);
+            context.RestartNode(1);
+            context.CreateConnection(useTLS: enableTls);
+
+            db = context.clusterTestUtils.GetDatabase();
+            ClassicAssert.AreEqual("before", (string)await db.StringGetAsync(key).ConfigureAwait(false));
+            ClassicAssert.IsTrue(await db.StringSetAsync(key, "after").ConfigureAwait(false));
+            ClassicAssert.AreEqual("after", (string)await db.StringGetAsync(key).ConfigureAwait(false));
+            context.clusterTestUtils.WaitForReplicaAofSync(0, 1, cancellation: deadline.Token);
+            replica = context.clusterTestUtils.GetServer(1);
+            ClassicAssert.AreEqual("after", (string)await replica.ExecuteAsync(
+                0, "GET", [key], flags: CommandFlags.NoRedirect).ConfigureAwait(false),
+                $"Offsets converged after AOF-only cluster recovery; primary version before restart " +
+                $"{versionBeforeRestart}, after restart {context.clusterTestUtils.GetStoreCurrentVersion(0)}, " +
+                $"replica version {context.clusterTestUtils.GetStoreCurrentVersion(1)}");
         }
 
         // Deterministic field value so a huge hash can be verified without holding every value in memory.
