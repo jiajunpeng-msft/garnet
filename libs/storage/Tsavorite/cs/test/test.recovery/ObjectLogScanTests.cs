@@ -674,6 +674,47 @@ namespace Tsavorite.test
             }
         }
 
+        [Test]
+        [Category("TsavoriteKV")]
+        public void CopiedScanRecordDeletedBeforeLivenessLookup()
+        {
+            log = Devices.CreateLogDevice(Path.Join(MethodTestDir, "scan-delete.log"), deleteOnClose: true);
+            objlog = Devices.CreateLogDevice(Path.Join(MethodTestDir, "scan-delete.obj.log"), deleteOnClose: true);
+            store = new(new()
+            {
+                IndexSize = 1L << 13,
+                LogDevice = log,
+                ObjectLogDevice = objlog,
+                MutableFraction = 1,
+                LogMemorySize = 1L << 20,
+                PageSize = 1L << 15
+            }, StoreFunctions.Create(comparer, () => new TestObjectValue.Serializer()),
+                (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions));
+
+            using var session = store.NewSession<TestObjectKey, TestObjectInput, TestObjectOutput, Empty, TestObjectFunctions>(new TestObjectFunctions());
+            var context = session.BasicContext;
+            var key = new TestObjectKey { key = 1 };
+            Assert.That(context.Upsert(key, new TestObjectValue { value = 42 }).IsCompletedSuccessfully, Is.True);
+
+            using var iterator = store.Log.Scan(store.Log.BeginAddress, store.Log.TailAddress);
+            Assert.That(iterator.GetNext(), Is.True);
+            Assert.That(iterator.Info.Invalid, Is.False);
+
+            // Delete after the iterator copies the record but before its hash-chain liveness lookup.
+            Assert.That(context.Delete(key).Found, Is.True);
+            Assert.That(iterator.Info.Invalid, Is.False, "The iterator retains its pre-delete copy");
+
+            var callbacks = new ScanCursorFuncs();
+            callbacks.Initialize(verifyKeys: false);
+            var state = new ScanCursorState();
+            state.Initialize(callbacks);
+            var status = context.ConditionalScanPush(state, in iterator,
+                iterator.CurrentAddress, iterator.NextAddress, store.Log.TailAddress);
+
+            Assert.That(status.Found, Is.True);
+            Assert.That(callbacks.numRecords, Is.Zero, "A concurrently deleted key must not be emitted");
+        }
+
         public class ScanFunctions : TestObjectFunctions
         {
             // Right now this is unused but helped with debugging so I'm keeping it around.
