@@ -2,9 +2,11 @@
 // Licensed under the MIT license.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 using NUnit.Framework;
 using Tsavorite.core;
 using static Tsavorite.core.Utility;
@@ -35,6 +37,7 @@ namespace Tsavorite.test
         [TearDown]
         public void TearDown()
         {
+            logDevice?.ReleaseWrites();
             store?.Dispose();
             store = null;
             logDevice?.Dispose();
@@ -177,6 +180,63 @@ namespace Tsavorite.test
             Assert.That(objectLogDevice.RemoveSegmentCount, Is.GreaterThan(0));
         }
 
+        /// <summary>
+        /// A flush that ends mid-sector leaves its last sector partly written, and the next flush reads that sector back to rewrite it.
+        /// ObjectAllocator issues each flush as soon as ReadOnlyAddress moves, without waiting for the previous flush's write to land, so
+        /// the read-back can run while that write is still in flight. It then reads past the end of the file, the flush fails, and
+        /// FlushedUntilAddress never advances again: the size tracker's eviction waits on it forever and allocations needing a new page hang.
+        /// </summary>
+        [Test]
+        [Category(TsavoriteKVTestCategory)]
+        [Category(ObjectIdMapCategory)]
+        public void PartialSectorReadBackWaitsForPreviousFlushWrite()
+        {
+            CreateStore(useLargeObjects: false, captureFlushFailures: true);
+
+            using var session = store.NewSession<TestObjectKey, TestObjectInput, TestObjectOutput, Empty, TestObjectFunctions>(new TestObjectFunctions());
+            var context = session.BasicContext;
+
+            _ = context.Upsert(new TestObjectKey { key = 1 }, new TestObjectValue { value = 1 }, Empty.Default);
+            var firstFlushEnd = store.Log.TailAddress;
+            Assert.That(firstFlushEnd % logDevice.SectorSize, Is.Not.Zero,
+                "The first flush must end mid-sector so the next flush performs a sector read-back.");
+
+            // Keep the first flush's main-log write in flight.
+            logDevice.HoldWrites();
+            store.Log.Flush(wait: false);
+            Assert.That(SpinWait.SpinUntil(() => logDevice.HeldWriteCount == 1, TimeSpan.FromSeconds(10)), Is.True,
+                "The first flush did not issue its main-log write.");
+
+            _ = context.Upsert(new TestObjectKey { key = 2 }, new TestObjectValue { value = 2 }, Empty.Default);
+            var secondFlushEnd = store.Log.TailAddress;
+            var secondFlush = Task.Run(() => store.Log.Flush(wait: false));
+
+            // Let the second flush reach its read-back of the shared sector, then let the first write land.
+            _ = secondFlush.Wait(TimeSpan.FromSeconds(1));
+            logDevice.ReleaseWrites();
+
+            // A failed flush never advances FlushedUntilAddress, so wait for whichever of success or failure is reported.
+            Assert.That(SpinWait.SpinUntil(() => flushFailureEvent.IsSet || store.Log.FlushedUntilAddress >= secondFlushEnd, TimeSpan.FromSeconds(10)), Is.True,
+                "The flush neither completed nor failed.");
+            Assert.That(flushFailureEvent.IsSet, Is.False,
+                $"The flush from {flushFailure.FromAddress} failed: {flushFailure.Exception?.Message ?? $"error {flushFailure.ErrorCode}"}");
+            Assert.That(secondFlush.Wait(TimeSpan.FromSeconds(10)), Is.True, "The second flush did not return.");
+            Assert.That(store.Log.FlushedUntilAddress, Is.EqualTo(secondFlushEnd));
+
+            // Both records read back intact from the device, including the first, whose last sector the second flush rewrote.
+            store.Log.FlushAndEvict(wait: true);
+            var input = new TestObjectInput();
+            for (var key = 1; key <= 2; key++)
+            {
+                var output = new TestObjectOutput();
+                var status = context.Read(new TestObjectKey { key = key }, ref input, ref output, Empty.Default);
+                if (status.IsPending)
+                    (status, output) = context.GetSinglePendingResult();
+                Assert.That(status.Found, Is.True, $"key {key} not found");
+                Assert.That(output.value.value, Is.EqualTo(key), $"key {key}");
+            }
+        }
+
         private void CreateStore(bool useLargeObjects, bool captureFlushFailures, long segmentSize = 1L << 30, long objectLogSegmentSize = 1L << 30)
         {
             logDevice = new(Devices.CreateLogDevice(Path.Join(MethodTestDir, "ObjectAllocatorDeviceFailureTests.log"), deleteOnClose: true));
@@ -246,6 +306,18 @@ namespace Tsavorite.test
         internal ulong LastFailedReadAddress { get; private set; }
         internal uint LastFailedReadLength { get; private set; }
 
+        private readonly object heldWritesLock = new();
+        private List<Action> heldWrites;
+
+        internal int HeldWriteCount
+        {
+            get
+            {
+                lock (heldWritesLock)
+                    return heldWrites?.Count ?? 0;
+            }
+        }
+
         internal ControlledReadFailureDevice(IDevice underlying)
             : base(underlying.FileName, underlying.SectorSize, underlying.Capacity)
         {
@@ -288,10 +360,40 @@ namespace Tsavorite.test
             }
         }
 
+        /// <summary>Queue subsequent writes instead of submitting them, until <see cref="ReleaseWrites"/>.</summary>
+        internal void HoldWrites()
+        {
+            lock (heldWritesLock)
+                heldWrites ??= [];
+        }
+
+        /// <summary>Submit the held writes, in order, and stop holding.</summary>
+        internal void ReleaseWrites()
+        {
+            List<Action> writes;
+            lock (heldWritesLock)
+            {
+                writes = heldWrites;
+                heldWrites = null;
+            }
+
+            foreach (var write in writes ?? [])
+                write();
+        }
+
         public override void WriteAsync(IntPtr sourceAddress, int segmentId, ulong destinationAddress, uint numBytesToWrite,
             DeviceIOCompletionCallback callback, object context)
         {
             _ = Interlocked.Increment(ref writeCount);
+            lock (heldWritesLock)
+            {
+                if (heldWrites is not null)
+                {
+                    heldWrites.Add(() => underlying.WriteAsync(sourceAddress, segmentId, destinationAddress, numBytesToWrite, callback, context));
+                    return;
+                }
+            }
+
             underlying.WriteAsync(sourceAddress, segmentId, destinationAddress, numBytesToWrite, callback, context);
         }
 
