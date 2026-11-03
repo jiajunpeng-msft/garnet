@@ -474,6 +474,80 @@ namespace Tsavorite.test
             }
         }
 
+        /// <summary>
+        /// As <see cref="SpanByteIterateLookupSnapshotEmitsKeyRcudAboveSnapshotTail"/>, but the replacement records above the captured
+        /// tail are evicted to disk before the scan, as happens within moments under a small log memory budget. The check for a newer
+        /// version then needs IO, and the pending continuation treats the on-disk record above <c>maxAddress</c> as newer: the in-range
+        /// version is dropped, and the newer one is beyond the scan, so the key is never emitted. During slot migration this leaves a key
+        /// that was updated on the source while the scan ran on the source only, and ownership moves without it.
+        /// </summary>
+        [Test]
+        [Category(TsavoriteKVTestCategory)]
+        [Category(SmokeTestCategory)]
+        public unsafe void SpanByteIterateLookupSnapshotEmitsKeyRcudAboveSnapshotTailOnDisk()
+        {
+            log = Devices.CreateLogDevice(Path.Join(MethodTestDir, "snapshot_rcu_above_disk.log"));
+            store = new(new()
+            {
+                IndexSize = 1L << 26,
+                LogDevice = log,
+                LogMemorySize = 1L << 25,
+                PageSize = 1L << 19,
+                SegmentSize = 1L << 22
+            }, StoreFunctions.Create(SpanByteComparer.Instance, SpanByteRecordTriggers.Instance)
+                , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions)
+            );
+
+            using var session = store.NewSession<TestSpanByteKey, PinnedSpanByte, int[], Empty, VLVectorFunctions>(new VLVectorFunctions());
+            var bContext = session.BasicContext;
+
+            Span<long> keySpan = stackalloc long[1];
+            Span<int> valueSpan = stackalloc int[1];
+            var key = TestSpanByteKey.FromPinnedSpan(MemoryMarshal.Cast<long, byte>(keySpan));
+            var value = MemoryMarshal.Cast<int, byte>(valueSpan);
+
+            const int totalRecords = 200;
+
+            for (var i = 0; i < totalRecords; i++)
+            {
+                keySpan[0] = i;
+                valueSpan[0] = i;
+                _ = bContext.Upsert(key, value);
+            }
+
+            // Make the records read-only so the next upsert must RCU rather than update in place.
+            store.Log.Flush(wait: true);
+
+            // Capture the tail *before* the RCU, so every replacement record lands above it.
+            var capturedTail = store.Log.TailAddress;
+
+            for (var i = 0; i < totalRecords; i++)
+            {
+                keySpan[0] = i;
+                valueSpan[0] = i * 10;
+                _ = bContext.Upsert(key, value);
+            }
+
+            // Evict everything, including the replacement records above the captured tail.
+            store.Log.FlushAndEvict(wait: true);
+            ClassicAssert.GreaterOrEqual(store.Log.HeadAddress, store.Log.TailAddress, "The replacement records must be on disk only");
+
+            // Same parameter pattern IterateLookupSnapshot uses internally: endAddress == maxAddress == capturedTail.
+            var fns = new SnapshotProbeAllFunctions { observed = new Dictionary<long, int>() };
+            long cursor = 0;
+            _ = session.ScanCursor(ref cursor, count: long.MaxValue, fns, endAddress: capturedTail, maxAddress: capturedTail);
+
+            ClassicAssert.AreEqual(totalRecords, fns.observed.Count,
+                "Snapshot must still emit every key whose RCU replacement landed above the captured tail and was evicted to disk");
+            for (var i = 0; i < totalRecords; i++)
+            {
+                ClassicAssert.IsTrue(fns.observed.TryGetValue(i, out var emittedValue),
+                    $"Key {i} was dropped by the snapshot scan even though it was live as of the captured tail");
+                ClassicAssert.AreEqual(i, emittedValue,
+                    $"Key {i}: snapshot must expose the pre-RCU (in-range) value");
+            }
+        }
+
         private struct SnapshotProbeAllFunctions : IScanIteratorFunctions
         {
             // NOTE: Must hold a reference type because the struct is boxed when stored in
