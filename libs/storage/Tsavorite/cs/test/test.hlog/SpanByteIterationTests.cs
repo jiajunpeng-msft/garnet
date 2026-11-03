@@ -474,6 +474,97 @@ namespace Tsavorite.test
             }
         }
 
+        /// <summary>
+        /// A bounded snapshot scan consumed in batches, as slot migration does: the reader ends each batch with
+        /// <see cref="CursorRecordResult.EndBatch"/> | <see cref="CursorRecordResult.RetryLastRecord"/> when it is full, and the next call
+        /// resumes from the returned cursor. A record whose check for a newer version needs IO is pushed only when that IO completes.
+        /// If the batch ends while such pushes are outstanding, the scan does not rewind the cursor to them: they complete when the
+        /// batch is already full, the reader rejects them, and no later batch revisits their records, so those keys are never emitted.
+        /// During slot migration such a key stays on the source and ownership moves without it.
+        /// <para/>
+        /// All keys share one hash chain, so once the log is evicted every record but the chain head needs IO to rule out a newer version.
+        /// </summary>
+        [Test]
+        [Category(TsavoriteKVTestCategory)]
+        [Category(SmokeTestCategory)]
+        public unsafe void SpanByteIterateLookupBatchesEmitKeysWhosePushIsPendingAtBatchEnd([Values(1, 3, 64)] int batchSize)
+        {
+            log = Devices.CreateLogDevice(Path.Join(MethodTestDir, "snapshot_pending_batch.log"));
+            using TsavoriteKV<StoreFunctions<spanbyte.SpanByteComparerModulo, SpanByteRecordTriggers>, SpanByteAllocator<StoreFunctions<spanbyte.SpanByteComparerModulo, SpanByteRecordTriggers>>> chainStore = new(new()
+            {
+                IndexSize = 1L << 26,
+                LogDevice = log,
+                LogMemorySize = 1L << 25,
+                PageSize = 1L << 19,
+                SegmentSize = 1L << 22
+            }, StoreFunctions.Create(new spanbyte.SpanByteComparerModulo(1), SpanByteRecordTriggers.Instance)
+                , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions)
+            );
+
+            using var session = chainStore.NewSession<TestSpanByteKey, PinnedSpanByte, int[], Empty, VLVectorFunctions>(new VLVectorFunctions());
+            var bContext = session.BasicContext;
+
+            Span<long> keySpan = stackalloc long[1];
+            Span<int> valueSpan = stackalloc int[1];
+            var key = TestSpanByteKey.FromPinnedSpan(MemoryMarshal.Cast<long, byte>(keySpan));
+            var value = MemoryMarshal.Cast<int, byte>(valueSpan);
+
+            const int totalRecords = 8;
+
+            for (var i = 0; i < totalRecords; i++)
+            {
+                keySpan[0] = i;
+                valueSpan[0] = i;
+                _ = bContext.Upsert(key, value);
+            }
+            chainStore.Log.FlushAndEvict(wait: true);
+            var capturedTail = chainStore.Log.TailAddress;
+
+            var fns = new BatchLimitedFunctions { batch = new List<(long, int)>(), limit = batchSize };
+            var observed = new Dictionary<long, int>();
+            long cursor = 0;
+            for (var call = 0; call < 4 * totalRecords; call++)
+            {
+                fns.batch.Clear();
+                _ = session.IterateLookup(ref fns, ref cursor, untilAddress: capturedTail, maxAddress: capturedTail, resetCursor: false);
+                if (fns.batch.Count == 0)
+                    break;
+                foreach (var (k, v) in fns.batch)
+                    observed[k] = v;
+            }
+
+            for (var i = 0; i < totalRecords; i++)
+            {
+                ClassicAssert.IsTrue(observed.TryGetValue(i, out var emittedValue),
+                    $"Key {i} was dropped by the batched snapshot scan; emitted {observed.Count} of {totalRecords} keys");
+                ClassicAssert.AreEqual(i, emittedValue, $"Key {i}");
+            }
+        }
+
+        private struct BatchLimitedFunctions : IScanIteratorFunctions
+        {
+            // Reference type: the struct is boxed when stored in ScanCursorState.functions.
+            public List<(long, int)> batch;
+            public int limit;
+
+            public readonly bool Reader<TSourceLogRecord>(in TSourceLogRecord logRecord, RecordMetadata recordMetadata, long numberOfRecords, out CursorRecordResult cursorRecordResult)
+                where TSourceLogRecord : ISourceLogRecord
+            {
+                if (batch.Count >= limit)
+                {
+                    cursorRecordResult = CursorRecordResult.EndBatch | CursorRecordResult.RetryLastRecord;
+                    return true;
+                }
+                batch.Add((MemoryMarshal.Cast<byte, long>(logRecord.Key)[0], MemoryMarshal.Cast<byte, int>(logRecord.ValueSpan)[0]));
+                cursorRecordResult = CursorRecordResult.Accept;
+                return true;
+            }
+
+            public readonly bool OnStart(long beginAddress, long endAddress) => true;
+            public readonly void OnException(Exception exception, long numberOfRecords) { }
+            public readonly void OnStop(bool completed, long numberOfRecords) { }
+        }
+
         private struct SnapshotProbeAllFunctions : IScanIteratorFunctions
         {
             // NOTE: Must hold a reference type because the struct is boxed when stored in
