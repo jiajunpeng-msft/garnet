@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using Garnet.common;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
@@ -208,6 +209,58 @@ namespace Garnet.test.cluster
         /// chunked (MigrationRecordSpanType.ChunkedLogRecord) streaming path: DiskLogRecord.Serialize streams each large record
         /// as chunks and the replica reassembles and deserializes them.
         /// </summary>
+        /// <summary>
+        /// The primary's streaming snapshot gives up when it sees no progress for <c>ReplicaSyncTimeout</c>, but it counts as progress
+        /// only flushes of records sent to the replica. A log that starts with a long run of superseded records (here: keys that were
+        /// set and then deleted, with the log mostly on disk) is scanned without sending anything, so a full sync of a primary whose
+        /// live data comes after that run times out even though the scan keeps advancing.
+        /// </summary>
+        [Test, Order(21)]
+        [Category("REPLICATION")]
+        public async Task ClusterDisklessSyncProgressesThroughSupersededRecords()
+        {
+            const int primaryIndex = 0;
+            const int replicaIndex = 1;
+            const int supersededKeys = 200_000;
+            const int liveKeys = 64;
+            context.CreateInstances(2, disableObjects: true, enableAOF: true, useTLS: useTLS, enableDisklessSync: true, timeout: timeout,
+                sublogCount: sublogCount, pageSize: "16k", memorySize: "1m", lowMemory: true, replicaSyncTimeout: 1);
+            context.CreateConnection(useTLS: useTLS);
+
+            _ = context.clusterTestUtils.AddDelSlotsRange(primaryIndex, [(0, 16383)], addslot: true, logger: context.logger);
+            context.clusterTestUtils.SetConfigEpoch(primaryIndex, primaryIndex + 1, logger: context.logger);
+            context.clusterTestUtils.SetConfigEpoch(replicaIndex, replicaIndex + 1, logger: context.logger);
+            context.clusterTestUtils.Meet(primaryIndex, replicaIndex, logger: context.logger);
+            context.clusterTestUtils.WaitUntilNodeIsKnown(primaryIndex, replicaIndex, logger: context.logger);
+
+            // Superseded prefix: every record needs a disk lookup to find the newer tombstone, and none is sent to the replica.
+            var db = context.clusterTestUtils.GetDatabase();
+            const int batchSize = 5000;
+            for (var start = 0; start < supersededKeys; start += batchSize)
+            {
+                var sets = Enumerable.Range(start, batchSize).Select(i => db.StringSetAsync($"dead{i}", i)).ToArray();
+                await Task.WhenAll(sets);
+            }
+            for (var start = 0; start < supersededKeys; start += batchSize)
+            {
+                var deletes = Enumerable.Range(start, batchSize).Select(i => db.KeyDeleteAsync($"dead{i}")).ToArray();
+                await Task.WhenAll(deletes);
+            }
+
+            context.kvPairs = [];
+            for (var i = 0; i < liveKeys; i++)
+            {
+                var key = $"{i}";
+                ClassicAssert.IsTrue(await db.StringSetAsync(key, i));
+                context.kvPairs[key] = i;
+            }
+
+            // Full diskless sync: today the primary fails it with "Streaming snapshot checkpoint timed out" before reaching the live keys.
+            _ = context.clusterTestUtils.ClusterReplicate(replicaNodeIndex: replicaIndex, primaryNodeIndex: primaryIndex, logger: context.logger);
+            context.clusterTestUtils.WaitForReplicaAofSync(primaryIndex, replicaIndex, logger: context.logger);
+            context.ValidateKVCollectionAgainstReplica(ref context.kvPairs, replicaIndex: replicaIndex, primaryIndex: primaryIndex);
+        }
+
         [Test, Order(20)]
         [Category("REPLICATION")]
         public void ClusterDisklessSyncLargeValuesChunked()
