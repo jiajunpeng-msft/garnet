@@ -121,12 +121,24 @@ namespace Tsavorite.core
         /// <param name="maxChunkSize">max size of returned chunk</param>
         /// <param name="token"> cancellation token </param>
         /// <typeparam name="T"> consumer type </typeparam>
-        public async Task BulkConsumeAllAsync<T>(T consumer, int throttleMs = 0, int maxChunkSize = 0, CancellationToken token = default) where T : IBulkLogEntryConsumer
+        public Task BulkConsumeAllAsync<T>(T consumer, int throttleMs = 0, int maxChunkSize = 0, CancellationToken token = default) where T : IBulkLogEntryConsumer
+            => BulkConsumeAllAsync(consumer, false, throttleMs, maxChunkSize, token);
+
+        /// <summary>
+        /// Asynchronously consume the log, optionally ending each chunk at a commit record.
+        /// </summary>
+        /// <param name="consumer">Consumer of the log records.</param>
+        /// <param name="stopAtCommitRecord">End chunks at commit records so their processing cannot invalidate later input in the same chunk.</param>
+        /// <param name="throttleMs">Throttle the iteration speed.</param>
+        /// <param name="maxChunkSize">Maximum size of returned chunks.</param>
+        /// <param name="token">Cancellation token.</param>
+        /// <typeparam name="T">Consumer type.</typeparam>
+        public async Task BulkConsumeAllAsync<T>(T consumer, bool stopAtCommitRecord, int throttleMs = 0, int maxChunkSize = 0, CancellationToken token = default) where T : IBulkLogEntryConsumer
         {
             while (!disposed)
             {
                 // TryConsumeNext returns false if we have to wait for the next record.
-                while (!TryBulkConsumeNext(consumer, maxChunkSize))
+                while (!TryBulkConsumeNext(consumer, maxChunkSize, stopAtCommitRecord))
                 {
                     if (throttleMs == 0)
                     {
@@ -470,9 +482,10 @@ namespace Tsavorite.core
         /// </summary>
         /// <param name="consumer">consumer</param>
         /// <param name="maxChunkSize"></param>
+        /// <param name="stopAtCommitRecord"></param>
         /// <typeparam name="T">concrete type of consumer</typeparam>
         /// <returns>whether a next entry is present</returns>
-        private unsafe bool TryBulkConsumeNext<T>(T consumer, int maxChunkSize = 0) where T : IBulkLogEntryConsumer
+        private unsafe bool TryBulkConsumeNext<T>(T consumer, int maxChunkSize, bool stopAtCommitRecord) where T : IBulkLogEntryConsumer
         {
             // Throttle and implicitly check for consumer liveness
             consumer.Throttle();
@@ -514,7 +527,8 @@ namespace Tsavorite.core
                     var totalLength = headerSize + Align(newEntryLength);
 
                     // Expand the records in iteration, as long as as they are on the same physical page
-                    while (ExpandGetNextInternal(startPhysicalAddress, ref totalLength, out _, out endLogicalAddress, out isCommitRecord))
+                    while ((!stopAtCommitRecord || !isCommitRecord) &&
+                        ExpandGetNextInternal(startPhysicalAddress, ref totalLength, out _, out endLogicalAddress, out isCommitRecord))
                     {
                         if (totalLength > maxChunkSize)
                             break;
