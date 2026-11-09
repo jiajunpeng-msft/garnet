@@ -309,11 +309,13 @@ namespace Garnet.cluster
                     if (!readLock)
                         throw new GarnetException("Failed to acquire replayLock");
 
+                    // Evicted null-device input cannot be reloaded between chunks.
                     await replayIterator.BulkConsumeAllAsync(
                         this,
-                        runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY),
+                        stopAtCommitRecord: !serverOptions.UseAofNullDevice,
+                        throttleMs: runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY),
                         maxChunkSize: 1 << 20,
-                        cts.Token).ConfigureAwait(false);
+                        token: cts.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {

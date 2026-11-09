@@ -200,11 +200,13 @@ namespace Garnet.server
                     logger?.LogInformation("Recover sublog [{physicalSublogIdx}] for addres range ({startAddress},{untilAddress})", physicalSublogIdx, startAddress, untilAddress);
                     while (!cts.IsCancellationRequested)
                     {
+                        // Evicted null-device input cannot be reloaded between chunks.
                         await replayIterator.BulkConsumeAllAsync(
                             this,
-                            runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY),
+                            stopAtCommitRecord: !serverOptions.UseAofNullDevice,
+                            throttleMs: runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY),
                             maxChunkSize: 1 << 20,
-                            cts.Token).ConfigureAwait(false);
+                            token: cts.Token).ConfigureAwait(false);
 
                         // Replay completed
                         if (replayIterator.NextAddress == untilAddress)
