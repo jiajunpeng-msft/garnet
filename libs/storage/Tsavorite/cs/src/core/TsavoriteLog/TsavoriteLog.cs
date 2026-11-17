@@ -697,10 +697,12 @@ namespace Tsavorite.core
 
         internal void TrueDispose()
         {
+            // Waits for a commit in progress, which writes commit metadata and may shift the begin address
+            commitQueue.Dispose();
+
             // Release our in-flight user-word slot back to the epoch. Iterators no longer parked; the
             // slot column is no longer referenced.
             epoch.ReleaseUserWord(inflightWord);
-            commitQueue.Dispose();
             FailCommitTask(commitTcs, new ObjectDisposedException("TsavoriteLog has been disposed"));
             allocator.Dispose();
             if (isEpochOwned)
@@ -757,6 +759,7 @@ namespace Tsavorite.core
         /// <param name="isProtected"></param>
         public void UnsafeCommitMetadataOnly(TsavoriteLogRecoveryInfo info, bool isProtected)
         {
+            GarnetAsserts.Assert(isProtected == epoch.ThisInstanceProtected());
             lock (ongoingCommitRequests)
             {
                 ongoingCommitRequests.Enqueue((info.UntilAddress, info));
